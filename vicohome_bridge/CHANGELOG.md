@@ -1,5 +1,9 @@
 # Vicohome Bridge Add-on Changelog
 
+## 1.1.5
+- Improved the telemetry publisher so it recognizes more battery and Wi-Fi signal fields from Vicohome payloads and always forwards that data to Home Assistant.
+- Added missing trailing newlines to repository metadata and the main run script to avoid formatting diffs when packaging the add-on.
+
 ## 1.1.4
 - Fixed a bash runtime error when telemetry payloads arrived without an explicit `online` field by ensuring the fallback logic
   always initializes the variable before use.

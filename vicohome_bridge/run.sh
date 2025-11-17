@@ -238,7 +238,7 @@ publish_device_health() {
   telemetry_payload=$(echo "${device_json}" | jq -c \
     --arg timestamp "${timestamp}" \
     --argjson online "${online_json}" \
-    '{batteryLevel:(.batteryLevel // null), signalStrength:(.signalStrength // null), online:$online, ip:(.ip // ""), timestamp:$timestamp}')
+    '{batteryLevel:(.batteryLevel // .battery_percent // .batteryPercent // .battery // null), signalStrength:(.signalStrength // .signal_strength // .signalDbm // .signal_dbm // .wifiStrength // .rssi // null), online:$online, ip:(.ip // ""), timestamp:$timestamp}')
 
   local telemetry_topic="${BASE_TOPIC}/${safe_id}/telemetry"
   mosquitto_pub ${MQTT_ARGS} \
