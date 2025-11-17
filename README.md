@@ -20,7 +20,6 @@ It:
 Tested on:
 
 - Home Assistant OS (aarch64 / Raspberry Pi)
-- Home Assistant OS on x86 mini-PC
 
 ---
 
@@ -182,6 +181,7 @@ By default the add-on:
   - `vicohome/<safe_camera_id>/events`
   - `vicohome/<safe_camera_id>/state`
   - `vicohome/<safe_camera_id>/motion` (`ON`/`OFF`)
+  - `vicohome/<safe_camera_id>/telemetry` (battery/WiFi/online details)
 
 - Registers MQTT Discovery entries for:
 
