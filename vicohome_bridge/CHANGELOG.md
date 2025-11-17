@@ -1,5 +1,8 @@
 # Vicohome Bridge Add-on Changelog
 
+## 1.1.6
+- Fixed the Last Event sensor discovery template so it also recognizes `event_type` payloads, ensuring Home Assistant always shows the motion type regardless of the JSON casing Vicohome uses.
+
 ## 1.1.5
 - Improved the telemetry publisher so it recognizes more battery and Wi-Fi signal fields from Vicohome payloads and always forwards that data to Home Assistant.
 - Added missing trailing newlines to repository metadata and the main run script to avoid formatting diffs when packaging the add-on.
