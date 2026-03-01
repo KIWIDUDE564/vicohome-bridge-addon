@@ -251,7 +251,7 @@ run_bootstrap_history() {
   fi
 
   if echo "${BOOTSTRAP_JSON}" | jq -e 'type=="array"' >/dev/null 2>&1; then
-    echo "${BOOTSTRAP_JSON}" | jq -c '.[]' | while read -r event; do
+    echo "${BOOTSTRAP_JSON}" | jq -c 'reverse | .[]' | while read -r event; do
       CAMERA_ID=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
       [ -z "${CAMERA_ID}" ] && continue
 
@@ -460,7 +460,7 @@ while true; do
 
   # If it's an array of events
   if echo "${JSON_OUTPUT}" | jq -e 'type=="array"' >/dev/null 2>&1; then
-    echo "${JSON_OUTPUT}" | jq -c '.[]' | while read -r event; do
+    echo "${JSON_OUTPUT}" | jq -c 'reverse | .[]' | while read -r event; do
       CAMERA_ID=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
       if [ -z "${CAMERA_ID}" ] || [ "${CAMERA_ID}" = "null" ]; then
         bashio::log.info "Event without camera/device ID, skipping. Event snippet: $(echo "${event}" | head -c 120)"
