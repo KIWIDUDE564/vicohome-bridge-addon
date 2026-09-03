@@ -92,6 +92,58 @@ fi
 mkdir -p /data
 
 # ==========================
+#  Published-event de-duplication state
+# ==========================
+# Persisted in /data (survives restarts and add-on updates) so we only ever
+# publish events we haven't published before, instead of re-publishing the
+# entire recent window on every poll. This is what keeps a busy camera from
+# generating hundreds of mosquitto_pub calls (and motion-pulse subshells) per
+# cycle and getting the add-on OOM-killed.
+SEEN_STATE_FILE="/data/published_events"
+SEEN_MAX_KEEP=1500          # bound the on-disk id list so it can't grow forever
+MAX_PUBLISH_PER_POLL=60     # hard safety cap on events published in one cycle
+declare -A SEEN_TRACE
+
+load_seen_state() {
+  SEEN_TRACE=()
+  if [ -f "${SEEN_STATE_FILE}" ]; then
+    local id
+    while IFS= read -r id; do
+      [ -n "${id}" ] && SEEN_TRACE["${id}"]=1
+    done < "${SEEN_STATE_FILE}"
+  fi
+}
+
+remember_seen() {
+  local id="$1"
+  [ -z "${id}" ] && return 0
+  SEEN_TRACE["${id}"]=1
+  echo "${id}" >> "${SEEN_STATE_FILE}"
+}
+
+trim_seen_state() {
+  # Keep only the most recent SEEN_MAX_KEEP ids on disk (atomic replace).
+  [ -f "${SEEN_STATE_FILE}" ] || return 0
+  local count
+  count=$(wc -l < "${SEEN_STATE_FILE}" 2>/dev/null || echo 0)
+  if [ "${count}" -gt "${SEEN_MAX_KEEP}" ]; then
+    tail -n "${SEEN_MAX_KEEP}" "${SEEN_STATE_FILE}" > "${SEEN_STATE_FILE}.tmp" 2>/dev/null && \
+      mv "${SEEN_STATE_FILE}.tmp" "${SEEN_STATE_FILE}"
+  fi
+}
+
+event_dedup_key() {
+  # Prefer the stable traceId; fall back to timestamp+serial so we still dedup
+  # if a payload ever omits traceId.
+  local ev="$1" key
+  key=$(echo "${ev}" | jq -r '.traceId // .trace_id // empty')
+  if [ -z "${key}" ] || [ "${key}" = "null" ]; then
+    key=$(echo "${ev}" | jq -r '((.timestamp // "") + "|" + (.serialNumber // .deviceId // ""))')
+  fi
+  echo "${key}"
+}
+
+# ==========================
 #  Helper functions
 # ==========================
 
@@ -232,6 +284,41 @@ publish_motion_pulse() {
   ) &
 }
 
+# Publish a single event (discovery + state/event topics + optional motion
+# pulse). Extracted from the main loop so it can be shared by the main loop and
+# the history bootstrap, and so de-duplication has one place to gate on.
+process_event() {
+  local event="$1"
+  local camera_id camera_name event_type safe_id event_preview
+
+  camera_id=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
+  if [ -z "${camera_id}" ] || [ "${camera_id}" = "null" ]; then
+    bashio::log.info "Event without camera/device ID, skipping. Event snippet: $(echo "${event}" | head -c 120)"
+    return 0
+  fi
+
+  camera_name=$(echo "${event}" | jq -r '.deviceName // .camera_name // .camera.name // .cameraName // .title // empty')
+  if [ -z "${camera_name}" ] || [ "${camera_name}" = "null" ]; then
+    camera_name="Camera ${camera_id}"
+  fi
+
+  event_type=$(echo "${event}" | jq -r '.eventType // .type // .event_type // empty')
+  safe_id=$(sanitize_id "${camera_id}")
+
+  event_preview=$(echo "${event}" | tr -d '\n' | head -c 400)
+  bashio::log.debug "Event for ${safe_id} (${camera_name}) type='${event_type}': ${event_preview}"
+
+  ensure_discovery_published "${camera_id}" "${camera_name}"
+  publish_event_for_camera "${safe_id}" "${event}"
+
+  case "${event_type}" in
+    motion|person|human|bird)
+      bashio::log.debug "Triggering motion pulse for ${safe_id} because event type '${event_type}' requires it."
+      publish_motion_pulse "${safe_id}"
+      ;;
+  esac
+}
+
 run_bootstrap_history() {
   if [ "${BOOTSTRAP_HISTORY}" != "true" ] || [ "${HAS_BOOTSTRAPPED}" = "true" ]; then
     return 0
@@ -251,21 +338,15 @@ run_bootstrap_history() {
   fi
 
   if echo "${BOOTSTRAP_JSON}" | jq -e 'type=="array"' >/dev/null 2>&1; then
-    echo "${BOOTSTRAP_JSON}" | jq -c '.[]' | while read -r event; do
-      CAMERA_ID=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
-      [ -z "${CAMERA_ID}" ] && continue
-
-      SAFE_ID=$(sanitize_id "${CAMERA_ID}")
-      CAMERA_NAME=$(echo "${event}" | jq -r '.deviceName // .camera_name // .camera.name // .cameraName // .title // empty')
-      EVENT_TYPE=$(echo "${event}" | jq -r '.eventType // .type // .event_type // empty')
-
-      ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
-      publish_event_for_camera "${SAFE_ID}" "${event}"
-
-      if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
-        publish_motion_pulse "${SAFE_ID}"
-      fi
-    done
+    load_seen_state
+    local key
+    while IFS= read -r event; do
+      key=$(event_dedup_key "${event}")
+      [ -n "${SEEN_TRACE[$key]}" ] && continue
+      process_event "${event}"
+      remember_seen "${key}"
+    done < <(echo "${BOOTSTRAP_JSON}" | jq -c 'sort_by(.timestamp) | .[]')
+    trim_seen_state
   fi
 
   HAS_BOOTSTRAPPED="true"
@@ -441,13 +522,6 @@ while true; do
     continue
   fi
 
-  if [ ${EXIT_CODE} -eq 0 ] && echo "${JSON_OUTPUT}" | grep -q "No events found"; then
-    bashio::log.info "vico-cli reported no events in the recent window."
-    bootstrap_history_if_needed
-    sleep "${POLL_INTERVAL}"
-    continue
-  fi
-
   bashio::log.info "vico-cli output (first 200 chars): $(echo "${JSON_OUTPUT}" | head -c 200)"
 
   # Quick sanity check so we don't feed clearly non-JSON into jq
@@ -458,64 +532,60 @@ while true; do
     continue
   fi
 
-  # If it's an array of events
+  # Normalize to a JSON array of events (the CLI returns either an array or a
+  # single object).
   if echo "${JSON_OUTPUT}" | jq -e 'type=="array"' >/dev/null 2>&1; then
-    echo "${JSON_OUTPUT}" | jq -c '.[]' | while read -r event; do
-      CAMERA_ID=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
-      if [ -z "${CAMERA_ID}" ] || [ "${CAMERA_ID}" = "null" ]; then
-        bashio::log.info "Event without camera/device ID, skipping. Event snippet: $(echo "${event}" | head -c 120)"
-        continue
-      fi
-
-      CAMERA_NAME=$(echo "${event}" | jq -r '.deviceName // .camera_name // .camera.name // .cameraName // .title // empty')
-      if [ -z "${CAMERA_NAME}" ] || [ "${CAMERA_NAME}" = "null" ]; then
-        CAMERA_NAME="Camera ${CAMERA_ID}"
-      fi
-      EVENT_TYPE=$(echo "${event}" | jq -r '.eventType // .type // .event_type // empty')
-
-      SAFE_ID=$(sanitize_id "${CAMERA_ID}")
-
-      event_preview=$(echo "${event}" | tr -d '\n' | head -c 400)
-      bashio::log.debug "Event for ${SAFE_ID} (${CAMERA_NAME}) type='${EVENT_TYPE}': ${event_preview}"
-
-      ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
-      publish_event_for_camera "${SAFE_ID}" "${event}"
-
-      if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
-        bashio::log.debug "Triggering motion pulse for ${SAFE_ID} because event type '${EVENT_TYPE}' requires it."
-        publish_motion_pulse "${SAFE_ID}"
-      fi
-    done
+    EVENTS_JSON="${JSON_OUTPUT}"
   else
-    # Single-event JSON object
-    event="${JSON_OUTPUT}"
+    EVENTS_JSON="[${JSON_OUTPUT}]"
+  fi
 
-    CAMERA_ID=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
-    if [ -z "${CAMERA_ID}" ] || [ "${CAMERA_ID}" = "null" ]; then
-      bashio::log.info "Single event without camera/device ID. Event snippet: $(echo "${event}" | head -c 120)"
-      sleep "${POLL_INTERVAL}"
+  first_run="false"
+  [ -f "${SEEN_STATE_FILE}" ] || first_run="true"
+  load_seen_state
+
+  # First run (no de-dup state yet): seed the state with every event currently
+  # in the window and publish only the most recent one. This gives the entities
+  # a current value without flooding MQTT with the entire backlog on boot -
+  # which is exactly what used to OOM-kill the add-on on an active camera.
+  if [ "${first_run}" = "true" ]; then
+    total=$(echo "${EVENTS_JSON}" | jq 'length')
+    bashio::log.info "First run: seeding de-dup state with ${total} existing event(s); publishing only the most recent to avoid a backlog flood."
+    newest=$(echo "${EVENTS_JSON}" | jq -c 'sort_by(.timestamp) | last // empty')
+    if [ -n "${newest}" ] && [ "${newest}" != "null" ]; then
+      process_event "${newest}"
+    fi
+    while IFS= read -r key; do
+      remember_seen "${key}"
+    done < <(echo "${EVENTS_JSON}" | jq -r '.[] | (.traceId // .trace_id // ((.timestamp // "") + "|" + (.serialNumber // .deviceId // "")))')
+    trim_seen_state
+    sleep "${POLL_INTERVAL}"
+    continue
+  fi
+
+  # Steady state: publish only events we have not published before, oldest
+  # first so the "last event" state topic ends on the newest event.
+  published=0
+  while IFS= read -r event; do
+    key=$(event_dedup_key "${event}")
+    if [ -n "${SEEN_TRACE[$key]}" ]; then
       continue
     fi
-
-    CAMERA_NAME=$(echo "${event}" | jq -r '.deviceName // .camera_name // .camera.name // .cameraName // .title // empty')
-    if [ -z "${CAMERA_NAME}" ] || [ "${CAMERA_NAME}" = "null" ]; then
-      CAMERA_NAME="Camera ${CAMERA_ID}"
+    if [ "${published}" -ge "${MAX_PUBLISH_PER_POLL}" ]; then
+      bashio::log.warning "Reached MAX_PUBLISH_PER_POLL (${MAX_PUBLISH_PER_POLL}); remaining new events will be published on the next poll."
+      break
     fi
-    EVENT_TYPE=$(echo "${event}" | jq -r '.eventType // .type // .event_type // empty')
+    process_event "${event}"
+    remember_seen "${key}"
+    published=$((published + 1))
+  done < <(echo "${EVENTS_JSON}" | jq -c 'sort_by(.timestamp) | .[]')
 
-    SAFE_ID=$(sanitize_id "${CAMERA_ID}")
-
-    event_preview=$(echo "${event}" | tr -d '\n' | head -c 400)
-    bashio::log.debug "Event for ${SAFE_ID} (${CAMERA_NAME}) type='${EVENT_TYPE}': ${event_preview}"
-
-    ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
-    publish_event_for_camera "${SAFE_ID}" "${event}"
-
-    if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
-      bashio::log.debug "Triggering motion pulse for ${SAFE_ID} because event type '${EVENT_TYPE}' requires it."
-      publish_motion_pulse "${SAFE_ID}"
-    fi
+  if [ "${published}" -gt 0 ]; then
+    bashio::log.info "Published ${published} new event(s) this poll."
+  else
+    bashio::log.debug "No new events this poll."
   fi
+  trim_seen_state
 
   sleep "${POLL_INTERVAL}"
 done

@@ -1,5 +1,12 @@
 # Vicohome Bridge Add-on Changelog
 
+## 2.1.0
+- Fixed a crash loop on active cameras: the main poll loop now publishes only **new** events instead of re-listing and re-publishing the entire recent window every cycle. Previously a busy camera (e.g. a bird feeder with a few hundred events/day) caused hundreds of `mosquitto_pub` calls and motion-pulse subshells per poll, which could get the add-on OOM-killed; when that happened every entity went `unavailable` even though the camera was online.
+- Added a persisted de-duplication store at `/data/published_events` (a bounded list of already-published event ids, `traceId` with a timestamp+serial fallback). It survives restarts and add-on updates.
+- Added safe first-run seeding: on the very first poll with no state, the add-on records every event currently in the window as already-seen and publishes only the most recent one, so a fresh install / restart with a full backlog no longer floods MQTT.
+- Added a `MAX_PUBLISH_PER_POLL` safety cap (60) so even an unexpected surge of new events can't blast MQTT in a single cycle; the remainder publish on subsequent polls.
+- Refactored the duplicated per-event publish logic into a single `process_event` function shared by the main loop and the history bootstrap, and removed dead code that called an undefined `bootstrap_history_if_needed`.
+
 ## 2.0.0
 - Added region-aware API routing so the add-on and bundled `vico-cli` can call the Vicohome EU or US endpoints (or auto-select the default) without manual code edits.
 - Exposed `region` and `api_base_override` configuration options and plumbed them through the runtime environment so every CLI command, telemetry poll, and motion pull honors the selected geography.
