@@ -217,6 +217,10 @@ func authenticateDirectly() (string, error) {
 		return "", fmt.Errorf("error reading response body: %w", err)
 	}
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("login HTTP status %d", resp.StatusCode)
+	}
+
 	// Try to parse as generic map first to handle all possible response formats
 	var responseMap map[string]interface{}
 	if err := json.Unmarshal(respBody, &responseMap); err != nil {
@@ -261,7 +265,8 @@ func authenticateDirectly() (string, error) {
 //   - error: Any error found in the response, or nil if no error was found
 func ValidateResponse(respBody []byte) (bool, error) {
 	// Check if we have a non-JSON response (probably HTML error page)
-	if len(respBody) > 0 && (respBody[0] == '<' || respBody[0] == '\r' || respBody[0] == '\n') {
+	respBody = bytes.TrimSpace(respBody)
+	if len(respBody) > 0 && respBody[0] == '<' {
 		// Print a preview for debugging
 		if isDebugMode() {
 			preview := string(respBody)
@@ -379,6 +384,9 @@ func ExecuteWithRetry(req *http.Request) ([]byte, error) {
 
 	// Check if we need to refresh the token
 	needsRefresh, apiErr := ValidateResponse(respBody)
+	if apiErr != nil && !needsRefresh {
+		return nil, apiErr
+	}
 	if needsRefresh {
 		// Only show detailed logs in debug mode
 		logDebug("Token refresh needed: %v\n", apiErr)
@@ -447,5 +455,8 @@ func ExecuteWithRetry(req *http.Request) ([]byte, error) {
 		}
 	}
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP request failed: status %d", resp.StatusCode)
+	}
 	return respBody, nil
 }
