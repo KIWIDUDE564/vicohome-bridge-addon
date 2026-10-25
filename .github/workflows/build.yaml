@@ -1,0 +1,36 @@
+name: Build and test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vicohome_bridge/vico-cli-main/go.mod
+          cache-dependency-path: vicohome_bridge/vico-cli-main/go.sum
+      - run: go test ./...
+        working-directory: vicohome_bridge/vico-cli-main
+      - run: bash -n vicohome_bridge/run.sh
+      - run: sudo apt-get update && sudo apt-get install -y jq python3-yaml
+      - run: python3 -m unittest discover -s tests -v
+      - run: |
+          base=$(python3 -c 'import yaml; print(yaml.safe_load(open("vicohome_bridge/build.yaml"))["build_from"]["${{ matrix.arch }}"])')
+          docker build --platform '${{ matrix.platform }}' --build-arg BUILD_FROM="$base" -t vicohome:test vicohome_bridge
+          docker run --rm --entrypoint /bin/bash vicohome:test -c 'vico-cli version && vico-cli events list --help && (mosquitto_pub --help 2>&1 | grep -q mosquitto_pub) && jq --version && bash -n /run.sh && bash -n /events.sh'
+      - run: bash tests/docker_smoke.sh vicohome:test
