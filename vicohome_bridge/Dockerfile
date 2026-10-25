@@ -34,7 +34,7 @@ WORKDIR /app
 COPY --from=builder /out/vico-cli /usr/local/bin/vico-cli
 
 # Copy run script
-COPY run.sh /run.sh
+COPY run.sh events.sh events.jq /
 RUN chmod a+x /run.sh
 
 CMD ["/run.sh"]
