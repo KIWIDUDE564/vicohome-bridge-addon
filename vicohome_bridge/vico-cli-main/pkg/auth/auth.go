@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/dydx/vico-cli/pkg/cache"
 )
@@ -204,7 +205,7 @@ func authenticateDirectly() (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("error making request: %w", err)
@@ -351,7 +352,7 @@ func ValidateResponse(respBody []byte) (bool, error) {
 //   - error: Any error encountered during the request process
 func ExecuteWithRetry(req *http.Request) ([]byte, error) {
 	// First attempt with current token
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 
 	// Make sure we can reuse the request body if needed
 	var requestBodyBytes []byte

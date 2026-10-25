@@ -37,39 +37,37 @@ type Device struct {
 
 var outputFormat string
 
+var authenticate = auth.Authenticate
+var fetchDeviceList = listDevices
+
 // listCmd represents the command to list all devices associated with the user's account.
 // It supports output in both table and JSON formats.
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all user devices",
 	Long:  `Fetch and display all devices associated with your Vicohome account.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		token, err := auth.Authenticate()
+	RunE: func(cmd *cobra.Command, args []string) error {
+		token, err := authenticate()
 		if err != nil {
-			fmt.Printf("Authentication failed: %v\n", err)
-			return
+			return fmt.Errorf("authentication failed: %w", err)
 		}
 
-		devices, err := listDevices(token)
+		devices, err := fetchDeviceList(token)
 		if err != nil {
-			fmt.Printf("Error fetching devices: %v\n", err)
-			return
+			return fmt.Errorf("error fetching devices: %w", err)
 		}
 
 		// Display devices
-		if len(devices) == 0 {
-			fmt.Println("No devices found.")
-			return
+		if len(devices) == 0 && outputFormat != "json" {
+			fmt.Fprintln(cmd.OutOrStdout(), "No devices found.")
+			return nil
 		}
 
 		if outputFormat == "json" {
-			// Output JSON format
-			prettyJSON, err := json.MarshalIndent(devices, "", "  ")
-			if err != nil {
-				fmt.Printf("Error formatting JSON: %v\n", err)
-				return
+			if devices == nil {
+				devices = []Device{}
 			}
-			fmt.Println(string(prettyJSON))
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(devices)
 		} else {
 			// Output table format
 			fmt.Printf("%-36s %-20s %-20s %-15s %-15s %-5s\n",
@@ -85,6 +83,7 @@ var listCmd = &cobra.Command{
 					device.BatteryLevel)
 			}
 		}
+		return nil
 	},
 }
 

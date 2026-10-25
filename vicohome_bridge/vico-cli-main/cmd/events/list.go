@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/dydx/vico-cli/pkg/auth"
@@ -24,6 +25,7 @@ type Request struct {
 // This structure contains information about bird sightings, including metadata
 // about the device that captured the event, the bird identified, and media URLs.
 type Event struct {
+	EventType      string  `json:"eventType"`
 	TraceID        string  `json:"traceId"`
 	Timestamp      string  `json:"timestamp"`
 	DeviceName     string  `json:"deviceName"`
@@ -47,6 +49,9 @@ var (
 	outputFormat string
 )
 
+var authenticate = auth.Authenticate
+var listEvents = fetchEvents
+
 // listCmd represents the command to list events from the Vicohome API.
 // It allows users to fetch events within a specified time range,
 // and supports output in both table and JSON formats.
@@ -55,18 +60,16 @@ var listCmd = &cobra.Command{
 	Short: "List events within a specified time range",
 	Long: `Fetch and display events from Vicohome API for the specified time period. 
 Times should be in format: 2025-05-18 14:59:25`,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		// Parse and validate time parameters
 		start, end, err := parseTimeParameters(startTime, endTime)
 		if err != nil {
-			fmt.Printf("Error parsing time parameters: %v\n", err)
-			return
+			return fmt.Errorf("error parsing time parameters: %w", err)
 		}
 
-		token, err := auth.Authenticate()
+		token, err := authenticate()
 		if err != nil {
-			fmt.Printf("Authentication failed: %v\n", err)
-			return
+			return fmt.Errorf("authentication failed: %w", err)
 		}
 
 		startTimestamp := fmt.Sprintf("%d", start.Unix())
@@ -79,27 +82,23 @@ Times should be in format: 2025-05-18 14:59:25`,
 			CountryNo:      auth.GetCountryCode(),
 		}
 
-		events, err := fetchEvents(token, eventsReq)
+		events, err := listEvents(token, eventsReq)
 		if err != nil {
-			fmt.Printf("Error fetching events: %v\n", err)
-			return
+			return fmt.Errorf("error fetching events: %w", err)
 		}
 
 		// Display events
-		if len(events) == 0 {
-			fmt.Println("No events found in the specified time period.")
-			return
+		if len(events) == 0 && outputFormat != "json" {
+			fmt.Fprintln(cmd.OutOrStdout(), "No events found in the specified time period.")
+			return nil
 		}
 
 		// Write to stdout
 		if outputFormat == "json" {
-			// Output JSON format
-			prettyJSON, err := json.MarshalIndent(events, "", "  ")
-			if err != nil {
-				fmt.Printf("Error formatting JSON: %v\n", err)
-				return
+			if events == nil {
+				events = []Event{}
 			}
-			fmt.Println(string(prettyJSON))
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(events)
 		} else {
 			// Output table format
 			fmt.Printf("%-36s %-20s %-25s %-25s %-25s\n",
@@ -114,6 +113,7 @@ Times should be in format: 2025-05-18 14:59:25`,
 					event.BirdLatin)
 			}
 		}
+		return nil
 	},
 }
 
@@ -222,20 +222,31 @@ func fetchEvents(token string, request Request) ([]Event, error) {
 // into the strongly-typed Event structure. It handles special processing for bird information,
 // timestamps, and keyshots. Default values are provided for missing or unidentified fields.
 func transformRawEvent(eventMap map[string]interface{}) Event {
-	event := Event{}
+	event := Event{EventType: "unknown"}
+	for _, key := range []string{"eventType", "type", "event_type"} {
+		if value, ok := eventMap[key].(string); ok && value != "" {
+			event.EventType = value
+			break
+		}
+	}
 
 	// Extract string fields
 	if val, ok := eventMap["traceId"].(string); ok {
 		event.TraceID = val
 	}
 
-	// Fix: Handle timestamp as a number
-	if val, ok := eventMap["timestamp"].(float64); ok {
-		// Convert Unix timestamp to human-readable format
-		t := time.Unix(int64(val), 0)
-		event.Timestamp = t.Format("2006-01-02 15:04:05")
-	} else if val, ok := eventMap["timestamp"].(string); ok {
-		event.Timestamp = val
+	// Normalize all supported timestamps to UTC so ordering never depends on host timezone.
+	switch value := eventMap["timestamp"].(type) {
+	case float64:
+		event.Timestamp = unixEventTime(value)
+	case string:
+		if number, err := strconv.ParseFloat(value, 64); err == nil {
+			event.Timestamp = unixEventTime(number)
+		} else if stamp, err := parseTimestamp(value); err == nil {
+			event.Timestamp = stamp.UTC().Format(time.RFC3339)
+		} else {
+			event.Timestamp = value
+		}
 	}
 
 	if val, ok := eventMap["deviceName"].(string); ok {
@@ -271,6 +282,10 @@ func transformRawEvent(eventMap map[string]interface{}) Event {
 			if infoMap, ok := info.(map[string]interface{}); ok {
 				// Check if this is a bird entry
 				if objectType, ok := infoMap["objectType"].(string); ok && objectType == "bird" {
+					// Preserve the explicit API classification when no event type was supplied.
+					if event.EventType == "unknown" {
+						event.EventType = "bird"
+					}
 					// Extract bird name
 					if birdName, ok := infoMap["objectName"].(string); ok {
 						event.BirdName = birdName
@@ -322,4 +337,12 @@ func transformRawEvent(eventMap map[string]interface{}) Event {
 	}
 
 	return event
+}
+
+// unixEventTime accepts API timestamps in seconds or milliseconds.
+func unixEventTime(value float64) string {
+	if value > 100000000000 {
+		value /= 1000
+	}
+	return time.Unix(int64(value), 0).UTC().Format(time.RFC3339)
 }
