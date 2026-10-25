@@ -4,9 +4,14 @@
 BRIDGE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${BRIDGE_LIB_DIR}/events.sh"
 
+# mosquitto_pub 2.0 has no -W timeout option. BusyBox timeout bounds connects/PUBACK waits.
+mqtt_publish() {
+  timeout 15 mosquitto_pub "$@"
+}
+
 publish_availability() {
   local state="$1"
-  mosquitto_pub "${MQTT_ARGS[@]}" -t "${AVAILABILITY_TOPIC}" -m "${state}" -r \
+  mqtt_publish "${MQTT_ARGS[@]}" -t "${AVAILABILITY_TOPIC}" -m "${state}" -q 1 -r \
     || bashio::log.warning "Failed to publish availability state '${state}' to ${AVAILABILITY_TOPIC}"
 }
 
@@ -14,104 +19,76 @@ sanitize_id() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g'
 }
 
-# v3 marker so HA treats these as a new generation of devices/entities
+# Keep Supervisor discovery as the default; an explicit host selects an external broker.
+configure_mqtt() {
+  MQTT_HOST=$(bashio::config 'mqtt_host')
+  if [ -n "$MQTT_HOST" ] && [ "$MQTT_HOST" != null ]; then
+    MQTT_PORT=$(bashio::config 'mqtt_port')
+    MQTT_USERNAME=$(bashio::config 'mqtt_username')
+    MQTT_PASSWORD=$(bashio::config 'mqtt_password')
+  else
+    if ! bashio::services.available mqtt; then
+      bashio::log.error "Configure mqtt_host or enable the Supervisor MQTT service."
+      return 1
+    fi
+    MQTT_HOST=$(bashio::services mqtt host)
+    MQTT_PORT=$(bashio::services mqtt port)
+    MQTT_USERNAME=$(bashio::services mqtt username)
+    MQTT_PASSWORD=$(bashio::services mqtt password)
+  fi
+  if [ -z "$MQTT_PORT" ] || [ "$MQTT_PORT" = null ]; then MQTT_PORT=1883; fi
+  MQTT_ARGS=(-h "$MQTT_HOST" -p "$MQTT_PORT")
+  if [ -n "$MQTT_USERNAME" ] && [ "$MQTT_USERNAME" != null ]; then
+    MQTT_ARGS+=(-u "$MQTT_USERNAME" -P "$MQTT_PASSWORD")
+  fi
+  if [ "$(bashio::config mqtt_tls)" = true ]; then
+    MQTT_ARGS+=(--cafile /etc/ssl/certs/ca-certificates.crt)
+  fi
+}
+
 ensure_discovery_published() {
-  local camera_id="$1"
-  local camera_name="$2"
-
-  local safe_id
-  safe_id=$(sanitize_id "${camera_id}")
-
-  local publish_required="true"
-  local marker="${DATA_DIR}/cameras_seen_v3_${safe_id}"
-  local now
-  now=$(date +%s)
-  local refresh_reason="initial publish"
-
-  if [ -f "${marker}" ]; then
-    local last_touch
-    last_touch=$(stat -c %Y "${marker}" 2>/dev/null || echo 0)
-    local age=$((now - last_touch))
-
-    if [ "${age}" -lt "${DISCOVERY_REFRESH_SECONDS}" ]; then
-      publish_required="false"
-    else
-      refresh_reason="${age}s since last publish exceeded ${DISCOVERY_REFRESH_SECONDS}s refresh window"
+  local camera_id="$1" camera_name="$2" safe_id marker now last=0 session=""
+  safe_id=$(sanitize_id "$camera_id")
+  marker="${DATA_DIR}/discovery_${safe_id}"
+  now=$(bridge_now)
+  if [ -f "$marker" ]; then
+    read -r session last < "$marker" || true
+    if [[ "$last" =~ ^[0-9]+$ ]] && [ "$session" = "$DISCOVERY_SESSION" ] && [ "$((now - last))" -lt "$DISCOVERY_REFRESH_SECONDS" ]; then
+      return 0
     fi
   fi
-
-  if [ "${publish_required}" != "true" ]; then
-    return 0
-  fi
-
-  bashio::log.debug "Publishing MQTT discovery for ${safe_id} (${camera_name}): ${refresh_reason}."
-
-  # v3 device identifier / unique_id base
-  local device_ident="vicohome_camera_v3_${safe_id}"
-  local state_topic="${BASE_TOPIC}/${safe_id}/state"
-  local motion_topic="${BASE_TOPIC}/${safe_id}/motion"
-  local telemetry_topic="${BASE_TOPIC}/${safe_id}/telemetry"
-
-  local sensor_topic="homeassistant/sensor/${device_ident}_last_event/config"
-  local motion_config_topic="homeassistant/binary_sensor/${device_ident}_motion/config"
-  local battery_config_topic="homeassistant/sensor/${device_ident}_battery/config"
-  local wifi_config_topic="homeassistant/sensor/${device_ident}_wifi/config"
-  local online_config_topic="homeassistant/binary_sensor/${device_ident}_online/config"
-
-  if [ -z "${camera_name}" ] || [ "${camera_name}" = "null" ]; then
-    camera_name="Camera ${camera_id}"
-  fi
-
-  # Last Event sensor (state = event type, attributes = full JSON)
-  local sensor_payload
-  sensor_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Last Event","unique_id":"${device_ident}_last_event","state_topic":"${state_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{{ value_json.eventType or value_json.type or value_json.event_type }}","json_attributes_topic":"${state_topic}","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
-
-  # Motion binary sensor (short pulse on motion/person/bird/human)
-  local motion_payload
-  motion_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Motion","unique_id":"${device_ident}_motion","state_topic":"${motion_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","device_class":"motion","payload_on":"ON","payload_off":"OFF","expire_after":30,"device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
-
-  local battery_payload
-  battery_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Battery","unique_id":"${device_ident}_battery","state_topic":"${telemetry_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{{ value_json.batteryLevel }}","unit_of_measurement":"%","device_class":"battery","state_class":"measurement","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
-
-  local wifi_payload
-  wifi_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} WiFi","unique_id":"${device_ident}_wifi","state_topic":"${telemetry_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{{ value_json.signalStrength }}","unit_of_measurement":"dBm","device_class":"signal_strength","state_class":"measurement","entity_category":"diagnostic","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
-
-  local online_payload
-  online_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Online","unique_id":"${device_ident}_online","state_topic":"${telemetry_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{% if value_json.online %}ON{% else %}OFF{% endif %}","payload_on":"ON","payload_off":"OFF","device_class":"connectivity","entity_category":"diagnostic","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
-
-  mosquitto_pub "${MQTT_ARGS[@]}" -t "${sensor_topic}" -m "${sensor_payload}" -q 0 || \
-    bashio::log.warning "Failed to publish MQTT discovery config for sensor ${device_ident}_last_event"
-
-  mosquitto_pub "${MQTT_ARGS[@]}" -t "${motion_config_topic}" -m "${motion_payload}" -q 0 || \
-    bashio::log.warning "Failed to publish MQTT discovery config for binary_sensor ${device_ident}_motion"
-
-  mosquitto_pub "${MQTT_ARGS[@]}" -t "${battery_config_topic}" -m "${battery_payload}" -q 0 || \
-    bashio::log.warning "Failed to publish MQTT discovery config for sensor ${device_ident}_battery"
-
-  mosquitto_pub "${MQTT_ARGS[@]}" -t "${wifi_config_topic}" -m "${wifi_payload}" -q 0 || \
-    bashio::log.warning "Failed to publish MQTT discovery config for sensor ${device_ident}_wifi"
-
-  mosquitto_pub "${MQTT_ARGS[@]}" -t "${online_config_topic}" -m "${online_payload}" -q 0 || \
-    bashio::log.warning "Failed to publish MQTT discovery config for binary_sensor ${device_ident}_online"
-
-  if ! touch "${marker}"; then
-    bashio::log.warning "Failed to update discovery marker ${marker}; discovery refresh scheduling may misbehave."
-  fi
+  if [ -z "$camera_name" ] || [ "$camera_name" = null ]; then camera_name="Camera ${camera_id}"; fi
+  local device_ident="vicohome_camera_v3_${safe_id}" suffix domain payload
+  for suffix in last_event motion battery wifi online; do
+    domain=sensor
+    case "$suffix" in motion|online) domain=binary_sensor;; esac
+    payload=$(jq -nc --arg suffix "$suffix" --arg ident "$device_ident" --arg name "Vicohome ${camera_name}" \
+      --arg base "${BASE_TOPIC}/${safe_id}" --arg availability "$AVAILABILITY_TOPIC" '
+      {unique_id:($ident+"_"+$suffix), availability_topic:$availability,
+       payload_available:"online",payload_not_available:"offline",
+       device:{identifiers:[$ident],name:$name,manufacturer:"Vicohome",model:"Camera"}}
+      + (if $suffix == "last_event" then
+          {name:($name+" Last Event"),state_topic:($base+"/state"),json_attributes_topic:($base+"/state"),
+           value_template:"{{ value_json.get(\"eventType\") or value_json.get(\"type\") or value_json.get(\"event_type\") or \"unknown\" }}"}
+         elif $suffix == "motion" then
+          {name:($name+" Motion"),state_topic:($base+"/motion"),device_class:"motion",payload_on:"ON",payload_off:"OFF",off_delay:5}
+         elif $suffix == "battery" then
+          {name:($name+" Battery"),state_topic:($base+"/telemetry"),device_class:"battery",state_class:"measurement",
+           unit_of_measurement:"%",value_template:"{{ value_json.get(\"batteryLevel\") }}"}
+         elif $suffix == "wifi" then
+          {name:($name+" WiFi"),state_topic:($base+"/telemetry"),device_class:"signal_strength",state_class:"measurement",
+           entity_category:"diagnostic",unit_of_measurement:"dBm",value_template:"{{ value_json.get(\"signalStrength\") }}"}
+         else
+          {name:($name+" Online"),state_topic:($base+"/telemetry"),device_class:"connectivity",entity_category:"diagnostic",
+           payload_on:"ON",payload_off:"OFF",value_template:"{% if value_json.get(\"online\") %}ON{% else %}OFF{% endif %}"}
+         end)') || return 1
+    if ! mqtt_publish "${MQTT_ARGS[@]}" -t "homeassistant/${domain}/${device_ident}_${suffix}/config" -m "$payload" -q 1 -r; then
+      bashio::log.warning "Discovery publication failed for ${device_ident}; will retry."
+      return 1
+    fi
+  done
+  mqtt_publish "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/motion" -m OFF -q 1 -r || return 1
+  printf '%s %s\n' "$DISCOVERY_SESSION" "$now" > "$marker"
 }
 
 publish_device_health() {
@@ -136,7 +113,7 @@ publish_device_health() {
   ip_raw=$(echo "${device_json}" | jq -r '.ip // empty')
 
   local online_raw
-  online_raw=$(echo "${device_json}" | jq -r '.online // .isOnline // .deviceOnline // empty' 2>/dev/null)
+  online_raw=$(echo "${device_json}" | jq -r 'if has("online") then .online elif has("isOnline") then .isOnline else .deviceOnline end | select(. != null)' 2>/dev/null)
   local online_json="false"
   local online_explicit="false"
   if [ -n "${online_raw}" ] && [ "${online_raw}" != "null" ]; then
@@ -177,7 +154,7 @@ publish_device_health() {
   local safe_id
   safe_id=$(sanitize_id "${camera_id}")
 
-  ensure_discovery_published "${camera_id}" "${camera_name}"
+  ensure_discovery_published "${camera_id}" "${camera_name}" || return 1
 
   local timestamp
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -199,21 +176,18 @@ publish_device_health() {
   bashio::log.debug "Telemetry payload for ${safe_id}: ${telemetry_payload}"
 
   local telemetry_topic="${BASE_TOPIC}/${safe_id}/telemetry"
-  mosquitto_pub "${MQTT_ARGS[@]}" \
+  mqtt_publish "${MQTT_ARGS[@]}" \
     -t "${telemetry_topic}" \
     -m "${telemetry_payload}" \
-    -q 0 || bashio::log.warning "Failed to publish telemetry for ${telemetry_topic}"
+    -q 1 -r || bashio::log.warning "Failed to publish telemetry for ${telemetry_topic}"
 }
 
 poll_device_health() {
   bashio::log.info "Polling vico-cli for device info..."
 
   local devices_output
-  devices_output=$("${VICO_CLI:-/usr/local/bin/vico-cli}" devices list --format json 2>/tmp/vico_devices_error.log)
-  local exit_code=$?
-
-  if [ ${exit_code} -ne 0 ]; then
-    bashio::log.warning "vico-cli devices list exited with code ${exit_code}."
+  if ! devices_output=$("${VICO_CLI:-/usr/local/bin/vico-cli}" devices list --format json 2>/tmp/vico_devices_error.log); then
+    bashio::log.warning "vico-cli devices list failed; retrying next poll."
     bashio::log.warning "stderr (first 200 chars): $(head -c 200 /tmp/vico_devices_error.log 2>/dev/null)"
     return
   fi
@@ -239,90 +213,80 @@ poll_device_health() {
 }
 
 bridge_main() {
-# Load bashio library
-source /usr/lib/bashio/bashio.sh
+  # Load bashio library
+  source /usr/lib/bashio/bashio.sh
 
-# ==========================
-#  Config from options.json
-# ==========================
-EMAIL=$(bashio::config 'email')
-PASSWORD=$(bashio::config 'password')
-POLL_INTERVAL=$(bashio::config 'poll_interval')
-LOG_LEVEL=$(bashio::config 'log_level')
-BASE_TOPIC=$(bashio::config 'base_topic')
-BOOTSTRAP_HISTORY=$(bashio::config 'bootstrap_history')
-REGION=$(bashio::config 'region')
-API_BASE_OVERRIDE=$(bashio::config 'api_base_override')
+  # ==========================
+  #  Config from options.json
+  # ==========================
+  EMAIL=$(bashio::config 'email')
+  PASSWORD=$(bashio::config 'password')
+  POLL_INTERVAL=$(bashio::config 'poll_interval')
+  LOG_LEVEL=$(bashio::config 'log_level')
+  BASE_TOPIC=$(bashio::config 'base_topic')
+  BOOTSTRAP_HISTORY=$(bashio::config 'bootstrap_history')
+  REGION=$(bashio::config 'region')
+  API_BASE_OVERRIDE=$(bashio::config 'api_base_override')
 
-[ -z "${BOOTSTRAP_HISTORY}" ] && BOOTSTRAP_HISTORY="false"
+  [ -z "${BOOTSTRAP_HISTORY}" ] && BOOTSTRAP_HISTORY="false"
 
-# Defaults
-[ -z "${POLL_INTERVAL}" ] && POLL_INTERVAL=60
-[ -z "${LOG_LEVEL}" ] && LOG_LEVEL="info"
-[ -z "${BASE_TOPIC}" ] && BASE_TOPIC="vicohome"
-if [ "${REGION}" = "null" ]; then
-  REGION=""
-fi
-[ -z "${REGION}" ] && REGION="auto"
-AVAILABILITY_TOPIC="${BASE_TOPIC}/bridge/status"
-# How often (in seconds) to refresh MQTT discovery payloads so deleted entities get recreated.
-DISCOVERY_REFRESH_SECONDS=300
+  # Defaults
+  if ! [[ "$POLL_INTERVAL" =~ ^[0-9]+$ ]] || [ "$POLL_INTERVAL" -lt 5 ] || [ "$POLL_INTERVAL" -gt 3600 ]; then POLL_INTERVAL=60; fi
+  [ -z "${LOG_LEVEL}" ] && LOG_LEVEL="info"
+  [ -z "${BASE_TOPIC}" ] && BASE_TOPIC="vicohome"
+  if [ "${REGION}" = "null" ]; then
+    REGION=""
+  fi
+  [ -z "${REGION}" ] && REGION="auto"
+  AVAILABILITY_TOPIC="${BASE_TOPIC}/bridge/status"
+  # How often (in seconds) to refresh MQTT discovery payloads so deleted entities get recreated.
+  DISCOVERY_REFRESH_SECONDS=300
+  DISCOVERY_SESSION="$(bridge_now)-$$"
 
-bashio::log.info "Vicohome Bridge configuration:"
-bashio::log.info "  poll_interval = ${POLL_INTERVAL}s"
-bashio::log.info "  base_topic    = ${BASE_TOPIC}"
-bashio::log.info "  log_level     = ${LOG_LEVEL}"
-bashio::log.info "  region        = ${REGION}"
-if [ -n "${API_BASE_OVERRIDE}" ] && [ "${API_BASE_OVERRIDE}" != "null" ]; then
-  bashio::log.info "  api_base_override = ${API_BASE_OVERRIDE}"
-else
-  API_BASE_OVERRIDE=""
-fi
+  bashio::log.info "Vicohome Bridge configuration:"
+  bashio::log.info "  poll_interval = ${POLL_INTERVAL}s"
+  bashio::log.info "  base_topic    = ${BASE_TOPIC}"
+  bashio::log.info "  log_level     = ${LOG_LEVEL}"
+  bashio::log.info "  region        = ${REGION}"
+  if [ -n "${API_BASE_OVERRIDE}" ] && [ "${API_BASE_OVERRIDE}" != "null" ]; then
+    bashio::log.info "  api_base_override = ${API_BASE_OVERRIDE}"
+  else
+    API_BASE_OVERRIDE=""
+  fi
 
-bashio::log.level "${LOG_LEVEL}"
+  bashio::log.level "${LOG_LEVEL}"
 
-if [ -z "${EMAIL}" ] || [ -z "${PASSWORD}" ]; then
-  bashio::log.error "You must set 'email' and 'password' in the add-on configuration."
-  exit 1
-fi
+  if [ -z "${EMAIL}" ] || [ -z "${PASSWORD}" ]; then
+    bashio::log.error "You must set 'email' and 'password' in the add-on configuration."
+    exit 1
+  fi
 
-# ==========================
-#  MQTT service discovery
-# ==========================
-if ! bashio::services.available "mqtt"; then
-  bashio::log.error "MQTT service not available. Make sure the MQTT integration/add-on is set up."
-  exit 1
-fi
+  # ==========================
+  #  MQTT service discovery
+  # ==========================
+  configure_mqtt || return 1
 
-MQTT_HOST=$(bashio::services mqtt "host")
-MQTT_PORT=$(bashio::services mqtt "port")
-MQTT_USERNAME=$(bashio::services mqtt "username")
-MQTT_PASSWORD=$(bashio::services mqtt "password")
+  bashio::log.info "Using MQTT broker at ${MQTT_HOST}:${MQTT_PORT}, base topic: ${BASE_TOPIC}"
 
-MQTT_ARGS=(-h "${MQTT_HOST}" -p "${MQTT_PORT}" -W 10)
-if [ -n "${MQTT_USERNAME}" ] && [ "${MQTT_USERNAME}" != "null" ]; then
-  MQTT_ARGS+=(-u "${MQTT_USERNAME}" -P "${MQTT_PASSWORD}")
-fi
+  trap 'publish_availability offline' EXIT
+  trap 'exit 0' TERM INT
+  publish_availability online
 
-bashio::log.info "Using MQTT broker at ${MQTT_HOST}:${MQTT_PORT}, base topic: ${BASE_TOPIC}"
+  # ==========================
+  #  Environment for vico-cli
+  # ==========================
+  export VICOHOME_EMAIL="${EMAIL}"
+  export VICOHOME_PASSWORD="${PASSWORD}"
+  export VICOHOME_DEBUG="0"
+  [ "$LOG_LEVEL" = debug ] && export VICOHOME_DEBUG="1"
+  export VICOHOME_REGION="${REGION}"
+  if [ -n "${API_BASE_OVERRIDE}" ]; then
+    export VICOHOME_API_BASE="${API_BASE_OVERRIDE}"
+  fi
 
-trap 'publish_availability offline' EXIT
-publish_availability online
-
-# ==========================
-#  Environment for vico-cli
-# ==========================
-export VICOHOME_EMAIL="${EMAIL}"
-export VICOHOME_PASSWORD="${PASSWORD}"
-export VICOHOME_DEBUG="1"
-export VICOHOME_REGION="${REGION}"
-if [ -n "${API_BASE_OVERRIDE}" ]; then
-  export VICOHOME_API_BASE="${API_BASE_OVERRIDE}"
-fi
-
-DATA_DIR="${DATA_DIR:-/data}"
-init_event_store || { bashio::log.error "Invalid delivery ledger; refusing to replay events."; return 1; }
-reset_motion true
+  DATA_DIR="${DATA_DIR:-/data}"
+  init_event_store || { bashio::log.error "Invalid delivery ledger; refusing to replay events."; return 1; }
+  reset_motion true
 
 
   local next_poll=0 now

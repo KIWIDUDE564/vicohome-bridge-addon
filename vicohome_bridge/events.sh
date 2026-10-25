@@ -49,17 +49,17 @@ process_events() {
     ensure_discovery_published "$camera" "$(jq -r '.deviceName // .cameraName // empty' <<< "$event")" || break
     # Non-retained event stream. Stop on failure so newer state never overtakes retries.
     if [ "$history" != true ]; then
-      mosquitto_pub "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/events" -m "$event" -q 1 || break
+      mqtt_publish "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/events" -m "$event" -q 1 || break
     fi
     if [ "$state" = true ]; then
-      mosquitto_pub "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/state" -m "$event" -q 1 -r || break
+      mqtt_publish "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/state" -m "$event" -q 1 -r || break
     fi
     deadline=0
     kind=$(jq -r '.eventType // "unknown" | if type=="string" then ascii_downcase else "unknown" end' <<< "$event")
     if [ "$history" != true ] && [ "$ts" -ge "$((now - 120))" ]; then
       case "$kind" in
         motion|person|human|bird)
-          mosquitto_pub "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/motion" -m ON -q 1 || break
+          mqtt_publish "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/motion" -m ON -q 1 || break
           deadline=$((now + 5)) ;;
       esac
     fi
@@ -77,7 +77,7 @@ reset_motion() {
   while IFS= read -r camera; do
     [ -z "$camera" ] && continue
     safe_id=$(sanitize_id "$camera")
-    if mosquitto_pub "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/motion" -m OFF -q 1; then
+    if mqtt_publish "${MQTT_ARGS[@]}" -t "${BASE_TOPIC}/${safe_id}/motion" -m OFF -q 1 -r; then
       jq --arg camera "$camera" 'del(.motion[$camera])' "$EVENT_STORE" > "${EVENT_STORE}.tmp" &&
         mv "${EVENT_STORE}.tmp" "$EVENT_STORE" || return 1
     fi

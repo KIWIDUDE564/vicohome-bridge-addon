@@ -14,7 +14,7 @@ startup: services
 boot: auto
 
 services:
-  - mqtt:need
+  - mqtt:want
 
 options:
   email: ""
@@ -25,13 +25,23 @@ options:
   bootstrap_history: true
   region: "auto"
   api_base_override: ""
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_tls: false
 
 schema:
   email: str
   password: password
-  poll_interval: int?
+  poll_interval: int(5,3600)?
   log_level: list(debug|info|warning|error)?
   base_topic: str?
   bootstrap_history: bool?
   region: list(auto|us|eu)?
   api_base_override: str?
+  mqtt_host: str?
+  mqtt_port: port?
+  mqtt_username: str?
+  mqtt_password: password?
+  mqtt_tls: bool?

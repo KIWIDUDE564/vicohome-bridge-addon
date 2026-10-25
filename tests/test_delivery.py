@@ -23,7 +23,7 @@ bashio::log.warning() { echo "$*" >&2; }
 bashio::log.debug() { :; }
 bashio::log.info() { :; }
 ensure_discovery_published() { return 0; }
-mosquitto_pub() {
+mqtt_publish() {
  python3 -c 'import json,os,sys; open(os.environ["LOG"],"a").write(json.dumps(sys.argv[1:])+"\n")' "$@"
  [[ "$*" != *"$FAIL"* || -z "$FAIL" ]]
 }
