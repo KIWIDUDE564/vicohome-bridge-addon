@@ -1,6 +1,10 @@
 # Vicohome Bridge Add-on for Home Assistant
 
-Repo: <https://github.com/KIWIDUDE564/vicohome-bridge-addon>
+Repo: <https://github.com/tomkennedy513/vicohome-bridge-addon>
+
+Fork of [KIWIDUDE564/vicohome-bridge-addon](https://github.com/KIWIDUDE564/vicohome-bridge-addon), preserving the upstream bridge architecture and bundled dydx/vico-cli attribution.
+
+Version 2.1.0 supports **amd64** and **aarch64 (ARM64)**. Changes under review live on `fix/multiarch-stability`; adding the repository URL in Home Assistant uses the default branch, so it will not install this branch until it is integrated. To test before integration, clone this fork with `git clone --branch fix/multiarch-stability https://github.com/tomkennedy513/vicohome-bridge-addon.git`, copy its `vicohome_bridge` directory into Home Assistant's `/addons` directory, reload the add-on store, and install it as a local add-on. Back up existing add-on data first; a local add-on has a different Supervisor identity.
 
 > ⚠️ **Unofficial integration.**  
 > This add-on is just a thin wrapper around the excellent open-source
@@ -20,9 +24,9 @@ It:
 - Provides a simple **dashboard** with last-event thumbnails and camera health
 - Works with Vicohome's **US and EU** API regions (auto-selects US by default, configurable)
 
-Tested on:
+Supported targets:
 
-- Home Assistant OS (aarch64 / Raspberry Pi)
+- Home Assistant OS or Supervised (amd64 or aarch64 / ARM64). Docker builds and broker smoke tests cover both architectures; live Home Assistant validation remains pending.
 
 ---
 
@@ -87,7 +91,7 @@ In Home Assistant:
 3. Add this repo URL:
 
    ```text
-   https://github.com/KIWIDUDE564/vicohome-bridge-addon
+   https://github.com/tomkennedy513/vicohome-bridge-addon
    ```
 
 4. Click **Add**, then **Close**.
@@ -108,7 +112,7 @@ You should now see **“Vicohome Bridge”** in the add-on list.
    - `poll_interval` – how often to poll for events (seconds)
    - `base_topic` – MQTT base topic (default: `vicohome`)
    - `log_level` – `debug`, `info`, `warning`, `error` (default: `info`). Use `debug` when you need extra telemetry/event payload details in the add-on logs.
-   - `bootstrap_history` – set to `false` to skip the one-time history pull when Vicohome returns "No events found" (default: `true`).
+   - `bootstrap_history` – enable a one-time, state-only five-day history pull after an empty recent response (default: `true`). Failures are retried.
    - `region` – `auto`, `us`, or `eu`. `auto` sticks with the US API unless you override it.
    - `api_base_override` – optional full URL (e.g. `https://api-eu.vicoo.tech`) if Vicohome introduces a new region hostname.
 
@@ -154,7 +158,7 @@ Then:
    [INFO] Using MQTT broker at core-mosquitto:1883, base topic: vicohome
    ```
 
-No manual host/port config is needed in the add-on; it grabs them from the MQTT service automatically.
+Supervisor discovery remains the default. For an external broker, set `mqtt_host`, `mqtt_port` (default `1883`), `mqtt_username`, and `mqtt_password` in the add-on options. Set `mqtt_tls: true` and the broker's TLS port (usually `8883`) for certificate-verified TLS using the container's system CA bundle. Private CA/client certificates are not configurable in this release. Empty `mqtt_host` selects the Supervisor service. The Home Assistant MQTT integration must use the same broker. Credentials with spaces or shell characters are passed as individual arguments.
 
 ### Troubleshooting & verbose logging
 
@@ -168,7 +172,19 @@ These extra details make it easier to see what the Vicohome cloud is returning a
 
 #### Historical bootstrap for Last Event sensors
 
-When `vico-cli` reports `No events found in the specified time period.`, the add-on performs a **one-time history pull** (last ~5 days) and replays those events to MQTT just like live motion. This ensures your Last Event sensors and automations have recent context even before fresh motion occurs. Disable `bootstrap_history` if you prefer to wait for brand new events instead of replaying history.
+When the recent event list is empty, `bootstrap_history` enables a one-time five-day pull using the CLI's supported `--startTime` and `--endTime` arguments. It seeds only the latest Last Event state **per camera**, without publishing historical event-stream messages or triggering motion. History work is capped at 60 cameras per pass, resumes after failures/restarts, and is marked complete only after successful state delivery. Initial recent results are seeded the same way for events predating this installation's persistent cutoff.
+
+#### Delivery, restarts, and motion
+
+The bridge keeps an atomic delivery ledger at `/data/delivery.json`. Normal batches are sorted chronologically, limited to 60 events per poll, and deduplicated across polls and restarts. Event identity combines camera ID and trace ID; missing IDs fall back to camera, timestamp, and type (indistinguishable events with the same fallback identity can coalesce). Events without a usable camera ID or timestamp are skipped. Existing `vicohome_camera_v3_...` discovery identities are preserved.
+
+MQTT publications use QoS 1. An event is acknowledged locally only after all required publications succeed. A partial MQTT failure or a crash between broker acknowledgement and the ledger write can cause duplicate deliveries on retry, including a repeated motion pulse. This provides retryable, at-least-once publication attempts within the fetched API window, **not exactly-once delivery or a durable cloud queue**. Polling cannot recover events omitted by the cloud, and a prolonged outage or backlog can outlive the API window (normally 24 hours). Events and dedup IDs older than six days are excluded together, preventing pruning from replaying old motion. The ledger's latest per-camera state prevents late events from moving Last Event backwards. Backlog events more than 120 seconds old update the event stream/state without motion.
+
+Motion ON is transient. The single polling process tracks five-second reset deadlines, retries failed resets, and clears outstanding pulses on restart. Discovery sets Home Assistant `off_delay: 5` as a fallback and retains an idle OFF value; no background process is created per event. Discovery, Last Event state, and telemetry are retained so Home Assistant can recover them after restarting. Event stream messages and motion ON are not retained. Signed thumbnail/clip URLs may expire even while retained state remains available.
+
+Availability uses retained online heartbeats and an offline publication on normal shutdown. **Short-lived publishers do not provide a persistent MQTT Last Will.** A hard crash, SIGKILL, host power loss, or broker disconnect can leave retained online stale until the next successful publication. This release does not claim immediate crash detection.
+
+A corrupt delivery ledger stops startup to avoid replay. Restore it from a backup, or stop the add-on and move the corrupt file aside to start with a new cutoff and state-only seeding. Deleting the ledger intentionally resets delivery history; keep `/data` when upgrading.
 
 #### Regional endpoints
 
@@ -522,6 +538,13 @@ Fix:
 - Huge thanks to **[@dydx](https://github.com/dydx)** for creating and maintaining
   [`vico-cli`](https://github.com/dydx/vico-cli) – this add-on is basically
   “`vico-cli` + MQTT + Home Assistant glue.”
-- Vicohome Bridge add-on + dashboard by the community (feel free to fork, tweak, and PR).
+- Original Vicohome Bridge add-on and dashboard by **[KIWIDUDE564](https://github.com/KIWIDUDE564)** and contributors; this fork maintains multiarch and runtime stability fixes.
 
 Issues / ideas / PRs welcome!
+
+
+## Development verification
+
+Run `go test ./...` inside `vicohome_bridge/vico-cli-main`, `python3 -m unittest discover -s tests -v` at the repository root (Python 3 and jq required), and Bash syntax checks on `run.sh` and `events.sh`. The workflow builds on native AMD64 and ARM64 runners and executes CLI/MQTT-client/jq/shell smoke checks. Local cross-platform Docker builds require emulation when the requested architecture differs from the host. See [tests/README.md](tests/README.md) for repeatable image and broker checks.
+
+Live Vicohome credentials, regional accounts, Home Assistant discovery/rendering, camera hardware behavior, cloud pagination/rate limits, and add-on upgrades require validation on your installation. Live video and richer galleries remain outside this release.

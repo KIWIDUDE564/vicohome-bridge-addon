@@ -1,5 +1,14 @@
 # Vicohome Bridge Add-on Changelog
 
+## 2.1.0
+- Build native amd64 and aarch64 images using architecture-specific Home Assistant bases and test both in CI.
+- Preserve CLI event classification, normalize timestamps to UTC, return JSON arrays for empty lists, and fail correctly on authentication, API, HTTP, and parsing errors.
+- Persist chronological event deduplication across restarts, cap live/history work, and seed only latest state per camera without historical motion. Failed publications remain retryable; partial failures may duplicate messages.
+- Replace per-event background motion processes with tracked deadlines and Home Assistant off-delay; retain discovery, state, telemetry, and idle OFF.
+- Encode camera names safely, guard missing template fields, retry failed discovery, and preserve existing v3 entity identities.
+- Add optional external MQTT host/port/credentials/TLS while retaining Supervisor discovery; pass MQTT arguments safely.
+- Point installation metadata at tomkennedy513's fork while crediting KIWIDUDE564 and dydx/vico-cli. Document delivery, availability, API-window and live-validation limits.
+
 ## 2.0.0
 - Added region-aware API routing so the add-on and bundled `vico-cli` can call the Vicohome EU or US endpoints (or auto-select the default) without manual code edits.
 - Exposed `region` and `api_base_override` configuration options and plumbed them through the runtime environment so every CLI command, telemetry poll, and motion pull honors the selected geography.

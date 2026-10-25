@@ -1,9 +1,9 @@
 name: "Vicohome Bridge"
 slug: "vicohome_bridge"
-version: "2.0.0"
+version: "2.1.0"
 description: "Home Assistant add-on that wraps the vico-cli Vicohome client and publishes events to MQTT with per-camera topics and MQTT discovery."
-url: "https://github.com/KIWIDUDE564/vicohome-bridge-addon"
-changelog: "https://github.com/KIWIDUDE564/vicohome-bridge-addon/blob/main/vicohome_bridge/CHANGELOG.md"
+url: "https://github.com/tomkennedy513/vicohome-bridge-addon"
+changelog: "https://github.com/tomkennedy513/vicohome-bridge-addon/blob/main/vicohome_bridge/CHANGELOG.md"
 
 arch:
   - aarch64
